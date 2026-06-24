@@ -17,68 +17,116 @@ const validCategories = [
   "General"
 ];
 
+/**
+ * Rule-based task analyzer: extracts duration, difficulty, and category.
+ * No LLM call needed; deterministic rules based on keywords and heuristics.
+ * THESIS: This replaces the LLM black box with transparent, auditable classification logic.
+ */
+function analyzeTask(title: string, description: string, userCategory?: string): {
+  duration: number;
+  difficulty: "easy" | "medium" | "hard";
+  category: string;
+  reasoning: string;
+} {
+  const fullText = `${title} ${description || ""}`.toLowerCase();
+
+  // Category detection via keyword matching
+  let category = userCategory;
+  if (!category) {
+    const categoryKeywords: { [cat: string]: string[] } = {
+      "Exam Review": ["exam", "test", "quiz", "study"],
+      "Assignment": ["homework", "assignment", "submit", "deadline"],
+      "Project": ["project", "build", "create", "develop", "code"],
+      "Presentation": ["present", "slide", "ppt", "speech"],
+      "Research": ["research", "investigate", "analyze", "explore"],
+      "Reading": ["read", "article", "chapter", "book", "paper"],
+      "Lab Work": ["lab", "experiment", "hands-on", "physical"],
+      "Email Management": ["email", "respond", "reply", "inbox"],
+      "Graphic Design": ["design", "graphic", "visual", "logo", "poster"],
+      "Video Editing": ["video", "edit", "film", "footage", "render"],
+      "Health": ["exercise", "walk", "sleep", "health", "doctor"],
+      "Fitness": ["fitness", "workout", "gym", "exercise"],
+      "Finance": ["budget", "invoice", "payment", "financial", "money"],
+      "Errands": ["grocery", "shop", "errand", "buy", "pickup"],
+    };
+
+    for (const [cat, keywords] of Object.entries(categoryKeywords)) {
+      if (keywords.some(kw => fullText.includes(kw))) {
+        category = cat;
+        break;
+      }
+    }
+
+    if (!category) category = "General";
+  }
+
+  // Duration estimation via keywords and patterns
+  let duration = 30; // Default 30 minutes
+  const durationPatterns: [RegExp, number][] = [
+    [/quick|fast|brief|5\s*min/i, 15],
+    [/30\s*min|half hour/i, 30],
+    [/hour|1\s*hr/i, 60],
+    [/2\s*hours?|two hours/i, 120],
+    [/3\s*hours?|three hours/i, 180],
+    [/half day|4\s*hours?/i, 240],
+    [/full day|8\s*hours?|all day/i, 480],
+  ];
+
+  for (const [pattern, mins] of durationPatterns) {
+    if (pattern.test(fullText)) {
+      duration = mins;
+      break;
+    }
+  }
+
+  // Difficulty estimation via complexity keywords
+  let difficulty: "easy" | "medium" | "hard" = "medium";
+  const easyKeywords = ["simple", "basic", "easy", "straightforward", "quick", "clear", "obvious"];
+  const hardKeywords = ["complex", "difficult", "hard", "challenging", "intricate", "research-heavy", "deep"];
+
+  const hasEasy = easyKeywords.some(kw => fullText.includes(kw));
+  const hasHard = hardKeywords.some(kw => fullText.includes(kw));
+
+  if (hasHard) difficulty = "hard";
+  else if (hasEasy) difficulty = "easy";
+  else {
+    // Heuristic: longer estimated tasks likely harder
+    if (duration > 120) difficulty = "hard";
+    else if (duration < 30) difficulty = "easy";
+  }
+
+  const reasoning = `Category: "${category}" (keyword match). Duration: ~${duration}min. Difficulty: "${difficulty}" (${
+    hasHard ? "complex keywords" : hasEasy ? "simple keywords" : "inferred from duration"
+  }).`;
+
+  return { duration, difficulty, category, reasoning };
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
   try {
     const { title, description, category } = await req.json();
-    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-    if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY not configured");
 
-    const categoryContext = category ? `\nUser-selected category: ${category}` : "";
-
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${LOVABLE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "google/gemini-3-flash-preview",
-        messages: [
-          {
-            role: "system",
-            content: `You are a task analyzer. Extract structured metadata from task descriptions. Available categories: ${validCategories.join(", ")}. If the user already selected a category, use that one.`
-          },
-          {
-            role: "user",
-            content: `Analyze this task and extract metadata:\nTitle: ${title}\nDescription: ${description || "No description"}${categoryContext}`
-          }
-        ],
-        tools: [{
-          type: "function",
-          function: {
-            name: "extract_task_metadata",
-            description: "Extract duration, difficulty, and category from a task",
-            parameters: {
-              type: "object",
-              properties: {
-                duration: { type: "number", description: "Estimated duration in minutes (5-480)" },
-                difficulty: { type: "string", enum: ["easy", "medium", "hard"], description: "Task difficulty level" },
-                category: { type: "string", enum: validCategories, description: "Task category" }
-              },
-              required: ["duration", "difficulty", "category"],
-              additionalProperties: false
-            }
-          }
-        }],
-        tool_choice: { type: "function", function: { name: "extract_task_metadata" } }
-      }),
-    });
-
-    if (!response.ok) {
-      const status = response.status;
-      const text = await response.text();
-      if (status === 429) return new Response(JSON.stringify({ error: "Rate limit exceeded" }), { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } });
-      if (status === 402) return new Response(JSON.stringify({ error: "Payment required" }), { status: 402, headers: { ...corsHeaders, "Content-Type": "application/json" } });
-      throw new Error(`AI error: ${status} ${text}`);
+    if (!title || typeof title !== "string") {
+      return new Response(JSON.stringify({ error: "title is required and must be a string" }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    const data = await response.json();
-    const toolCall = data.choices?.[0]?.message?.tool_calls?.[0];
-    if (!toolCall) throw new Error("No tool call in response");
+    const result = analyzeTask(title, description, category);
 
-    const result = JSON.parse(toolCall.function.arguments);
+    // Validate category
+    if (!validCategories.includes(result.category)) {
+      result.category = "General";
+    }
+
+    // Ensure duration is in valid range
+    if (result.duration < 5 || result.duration > 480) {
+      result.duration = Math.max(5, Math.min(480, result.duration));
+    }
+
     return new Response(JSON.stringify(result), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
